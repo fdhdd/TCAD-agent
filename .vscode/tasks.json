@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "TCAD Agent Frontend",
+			"type": "shell",
+			"command": "npm run dev:frontend",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "TCAD Agent Backend",
+			"type": "shell",
+			"command": "npm run dev:backend",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

@@ -1,0 +1,55 @@
+{
+  "id": "script_1778818487055",
+  "name": "Generated TCAD Script",
+  "type": "sdevice",
+  "content": "File {\n   Grid = \"nmos_msh.tdr\"\n   Plot = \"des.tdr\"\n   Current = \"des.plt\"\n   Output = \"des.log\"\n}\n\nElectrode {\n   { Name=\"source\"   Voltage=0.0 }\n   { Name=\"drain\"    Voltage=0.0 }\n   { Name=\"gate\"     Voltage=0.0 }\n   { Name=\"substrate\" Voltage=0.0 }\n}\n\nPhysics {\n   AreaFactor=1e-4\n   Mobility( DopingDependence HighFieldSaturation Enormal )\n   EffectiveIntrinsicDensity( OldSlotboom )\n   Recombination( SRH(DopingDependence) Auger )\n}\n\nPlot {\n   eDensity hDensity\n   eCurrent hCurrent\n   Potential SpaceCharge\n   ElectricField\n   eMobility hMobility\n   Doping DonorConcentration AcceptorConcentration\n   eQuasiFermi hQuasiFermi\n}\n\nMath {\n   Extrapolate\n   RelErrControl\n   Digits=5\n   Notdamped=50\n   Iterations=20\n   Method=ParDiSo\n   NumberOfThreads=4\n}\n\nSolve {\n   Coupled(Iterations=100) { Poisson }\n   Coupled(Iterations=100) { Poisson Electron Hole }\n   Quasistationary ( InitialStep=0.01 MaxStep=0.1 MinStep=1e-10\n                     Goal { Name=\"drain\" Voltage=0.1 } )\n   { Coupled(Iterations=100) { Poisson Electron Hole } }\n   Quasistationary ( InitialStep=0.01 MaxStep=0.1 MinStep=1e-10\n                     Goal { Name=\"gate\" Voltage=1.0 } )\n   { Coupled(Iterations=100) { Poisson Electron Hole } }\n   Quasistationary ( InitialStep=0.01 MaxStep=0.1 MinStep=1e-10\n                     Goal { Name=\"drain\" Voltage=1.0 } )\n   { Coupled(Iterations=100) { Poisson Electron Hole } }\n}",
+  "parameters": [
+    {
+      "id": "param_0_Area_Factor",
+      "name": "Area Factor",
+      "value": 0.0001,
+      "type": "number",
+      "range": [
+        0.01,
+        100
+      ],
+      "description": "面积因子"
+    },
+    {
+      "id": "param_1_Iterations",
+      "name": "Iterations",
+      "value": 20,
+      "type": "number",
+      "range": [
+        10,
+        500
+      ],
+      "description": "迭代次数"
+    },
+    {
+      "id": "param_3_Mobility_Model",
+      "name": "Mobility Model",
+      "value": "Enabled",
+      "type": "string",
+      "description": "迁移率模型"
+    },
+    {
+      "id": "param_4_Recombination",
+      "name": "Recombination",
+      "value": "Enabled",
+      "type": "string",
+      "description": "复合模型"
+    },
+    {
+      "id": "param_6_Voltage",
+      "name": "Voltage",
+      "value": 0,
+      "type": "number",
+      "range": [
+        0,
+        5
+      ],
+      "description": "电压值 (V)"
+    }
+  ]
+}

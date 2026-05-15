@@ -1,0 +1,32 @@
+# TCAD Agent Dependencies
+# Run: npm install to install all dependencies
+
+# Frontend Dependencies
+react@^18.2.0
+react-dom@^18.2.0
+react-router-dom@^6.20.0
+zustand@^4.4.0
+chart.js@^4.4.0
+react-chartjs-2@^5.2.0
+lucide-react@^0.290.0
+@monaco-editor/react@^4.6.0
+
+# Backend Dependencies
+express@^4.18.2
+cors@^2.8.5
+dotenv@^16.3.1
+ssh2@^1.14.0
+
+# Dev Dependencies
+@types/react@^18.2.0
+@types/react-dom@^18.2.0
+@types/express@^4.17.21
+@types/cors@^2.8.17
+@vitejs/plugin-react@^4.2.0
+typescript@^5.3.0
+vite@^5.0.0
+tailwindcss@^3.3.0
+autoprefixer@^10.4.0
+postcss@^8.4.0
+tsx@^4.6.0
+concurrently@^8.2.0
