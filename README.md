@@ -205,13 +205,13 @@ The system prompt (`TCAD_SYSTEM_PROMPT.md`) enforces hard constraints:
 ## Example Session
 
 ```
-👤  打开 /home/huaweitang/STDB/SingleDevice 项目
+👤  打开 /home/STDB/SingleDevice 项目
 
 💭 模型思考过程:
    用户要求打开项目，调用 tcad_open_project。
 💭 思考结束
 
-项目: /home/huaweitang/STDB/SingleDevice
+项目: /home/STDB/SingleDevice
   工具列表: ['sde', 'sdevice', 'svisual']
   参数列表: ['Lg']
   步骤数: 4
