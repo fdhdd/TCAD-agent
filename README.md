@@ -129,12 +129,14 @@ When `tcad_run_simulation` is called with `monitor=True` (default), a background
 ### Installation
 
 ```bash
-# 1. Install swbpy2 into TCAD Python
-cd /usr/synopsys/sentaurus/X-2025.06/tcad/X-2025.06/lib
-/path/to/tcad/python3.11 -m pip install swbpy2-*.whl swbutils-*.whl
+# 1. Create virtual environment with uv (uses TCAD's Python 3.11 as system site-packages)
+export STROOT=/usr/synopsys/sentaurus/X-2025.06
+export STRELEASE=X-2025.06
+uv venv --system-site-packages --python "$STROOT/tcad/$STRELEASE/linux64/bin/python3.11"
 
-# 2. Install langchain dependencies into TCAD Python
-/path/to/tcad/python3.11 -m pip install langchain langchain-openai langgraph python-dotenv numpy pydantic
+# 2. Activate venv and install dependencies
+source .venv/bin/activate
+uv pip install langchain langchain-openai langgraph python-dotenv numpy==1.24.0 pydantic
 
 # 3. Configure environment
 cp .env.example .env   # edit with your API key and model settings
