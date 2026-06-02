@@ -1,0 +1,33 @@
+# Environment (API keys, secrets)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+cmlog.txt
+server.log
+
+# LangGraph runtime
+.langgraph_api/
+.playwright-mcp/
+home/
+
+# Node
+node_modules/
+.next/
