@@ -2,18 +2,15 @@ import os
 import sys
 import time
 import threading
-import functools
 import logging
 from typing import Any, Dict, List, Optional, Type
 import numpy as np
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
 
-import sim_progress
-
 logger = logging.getLogger(__name__)
 
-TCAD_ROOT = os.environ.get("STROOT", "/opt/synopsys/sentaurus")
+TCAD_ROOT = os.environ.get("STROOT", "/usr/synopsys/sentaurus/X-2025.06")
 TCAD_RELEASE = os.environ.get("STRELEASE", "X-2025.06")
 
 
@@ -32,20 +29,6 @@ def setup_tcad_environment() -> None:
 
 
 _swb_imported: bool = False
-_swb_lock = threading.RLock()
-
-
-def _swb_locked(fn):
-    """Decorator: acquire _swb_lock before calling fn.
-
-    Ensures all swbpy2 (C++ extension) calls are serialised, because
-    the underlying library is NOT thread-safe.
-    """
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _swb_lock:
-            return fn(*args, **kwargs)
-    return wrapper
 
 
 def _ensure_swbpy2():
@@ -181,7 +164,6 @@ class TCADProjectTool(BaseTool):
     )
     args_schema: Type[BaseModel] = InspectProjectSchema
 
-    @_swb_locked
     def _run(self, project_path: str, detail: str = "summary",
              scenario: str = "all", node: Optional[int] = None) -> str:
         try:
@@ -275,7 +257,6 @@ class TCADSimulationTool(BaseTool):
     )
     args_schema: Type[BaseModel] = RunSimulationSchema
 
-    @_swb_locked
     def _run(self, project_path: str, mode: str = "both",
              nodes: Optional[List[int]] = None,
              preprocess_kw: Optional[Dict[str, Any]] = None,
@@ -323,17 +304,6 @@ class TCADSimulationTool(BaseTool):
                         result_lines.append(
                             f"  节点 {n} ({tree.NodeTool(n)}) 路径: {tree.NodePath(n)}"
                         )
-
-                # 初始化进度跟踪（供前端实时轮询）
-                nodes_info = []
-                for n in target_nodes:
-                    if tree.NodeExists(n):
-                        nodes_info.append({
-                            "id": n,
-                            "tool": tree.NodeTool(n),
-                        })
-                sim_id = sim_progress.create_progress(project_path, nodes_info)
-                result_lines.append(f"\n📊 仿真ID: {sim_id}")
                 result_lines.append("\n⏳ 启动仿真，同时监控 .out 输出...\n")
                 initial_reply = "\n".join(result_lines)
                 print(initial_reply, flush=True)
@@ -346,39 +316,57 @@ class TCADSimulationTool(BaseTool):
                 stop_event = threading.Event()
 
                 def _monitor_loop():
-                    # File-only monitor: no swbpy2 calls (runs in a bg thread)
                     deadline = time.time() + monitor_timeout
+                    last_status: Dict[int, str] = {}
                     while not stop_event.is_set() and time.time() < deadline:
                         time.sleep(3)
+
+                        all_done = True
+                        status_changed = False
                         for n in target_nodes:
-                            ti = track.get(n)
-                            if ti is None:
+                            if not tree.NodeExists(n):
                                 continue
+                            s = tree.NodeStatus(n)
+                            if s != last_status.get(n):
+                                status_changed = True
+                            last_status[n] = s
+                            if s not in ("done", "failed", "aborted"):
+                                all_done = False
+
                             out_files = _find_node_out_files(project_path, n)
+                            ti = track[n]
                             for fpath in out_files:
                                 if fpath not in ti["positions"]:
                                     ti["positions"][fpath] = 0
                                 try:
                                     with open(fpath, "r", errors="replace") as f:
-                                        file_lines = f.readlines()
+                                        lines = f.readlines()
                                 except (OSError, IOError):
                                     continue
-                                total = len(file_lines)
+                                total = len(lines)
                                 pos = ti["positions"][fpath]
                                 if pos < total:
-                                    new_text = "".join(file_lines[pos:]).rstrip()
+                                    new_text = "".join(lines[pos:]).rstrip()
                                     if new_text:
                                         for line in new_text.split("\n"):
                                             stripped = line.strip()
                                             if stripped:
-                                                sim_progress.feed_line(
-                                                    sim_id, n, stripped
-                                                )
                                                 print(
                                                     f"  [节点 {n} {ti['tool']}] {stripped}",
                                                     flush=True,
                                                 )
                                     ti["positions"][fpath] = total
+
+                        if status_changed:
+                            status_str = ", ".join(
+                                f"节点 {n}: {s}" for n, s in sorted(last_status.items())
+                            )
+                            print(f"  📊 {status_str}", flush=True)
+
+                        if all_done:
+                            print("  ✅ 全部节点仿真完成！", flush=True)
+                            return
+
                     if not stop_event.is_set():
                         print(f"  ⏰ 监控超时 ({monitor_timeout}秒)", flush=True)
 
@@ -394,7 +382,6 @@ class TCADSimulationTool(BaseTool):
 
                 # 仿真结束，停止监控
                 stop_event.set()
-                sim_progress.mark_done(sim_id)
                 monitor_thread.join(timeout=5)
 
                 final_lines = ["\n📊 仿真结果:"]
@@ -434,7 +421,6 @@ class TCADStatusTool(BaseTool):
     )
     args_schema: Type[BaseModel] = StatusSchema
 
-    @_swb_locked
     def _run(self, project_path: str, scenario: str = "all",
              node: Optional[int] = None,
              status_filter: Optional[str] = None) -> str:
@@ -511,7 +497,6 @@ class TCADModifyTool(BaseTool):
     )
     args_schema: Type[BaseModel] = ModifyProjectSchema
 
-    @_swb_locked
     def _run(self, project_path: str, action: str,
              params: Dict[str, Any] = None) -> str:
         try:
@@ -529,6 +514,25 @@ class TCADModifyTool(BaseTool):
                 if not tool_name or not db_tool_name:
                     return "add_tool 需要 tool_name 和 db_tool_name 参数"
                 tree.AddTool(tool_name, db_tool_name, step, toSave=True)
+
+                # 获取工具的 acronym 用于 .cmd 文件命名
+                acronym = db_tool_name  # 默认使用 db_tool_name
+                try:
+                    acronym = tree.GetDBToolCtxItem(f'{db_tool_name},acronym')
+                except Exception:
+                    pass
+
+                # 自动创建 .cmd 脚本文件（如果不存在）
+                cmd_filename = f"{tool_name}_{acronym}.cmd"
+                cmd_filepath = os.path.join(os.path.abspath(project_path), cmd_filename)
+                if not os.path.exists(cmd_filepath):
+                    with open(cmd_filepath, "w") as f:
+                        pass  # 创建空文件
+                    return (
+                        f"工具 '{tool_name}' (db: {db_tool_name}) 已添加到 step {step}\n"
+                        f"已创建脚本文件: {cmd_filename}\n"
+                        f"提示: 可使用 tcad_modify_script 工具编写脚本内容。"
+                    )
                 return f"工具 '{tool_name}' (db: {db_tool_name}) 已添加到 step {step}"
 
             elif action == "add_param":
@@ -605,7 +609,6 @@ class TCADResultsTool(BaseTool):
     )
     args_schema: Type[BaseModel] = ResultsSchema
 
-    @_swb_locked
     def _run(self, project_path: str, node: int,
              trials: int = 3, delay: int = 3) -> str:
         try:
@@ -651,7 +654,6 @@ class TCADCleanupTool(BaseTool):
 
     args_schema = CleanupSchema
 
-    @_swb_locked
     def _run(self, project_path: str, level: str = "default",
              nodes: Optional[List[int]] = None) -> str:
         try:
@@ -688,6 +690,39 @@ class TCADCleanupTool(BaseTool):
             return f"项目清理失败: {type(e).__name__}: {e}"
 
 
+def _find_node_out_files(project_path: str, node: int) -> List[str]:
+    """Find .out files for a simulation node.
+
+    SWB writes simulation stdout/stderr to ``.out`` files inside each
+    node's working directory.  This helper discovers them by globbing
+    the node directory.
+
+    Returns:
+        Sorted list of absolute .out file paths (may be empty if the
+        node hasn't been run yet).
+    """
+    try:
+        _ensure_swbpy2()
+        tree = _get_tree(project_path)
+        if not tree.NodeExists(node):
+            return []
+        tool_name = tree.NodeTool(node)
+        node_path = tree.NodePath(node)
+        scenarios = tree.AllScenarios()
+        for sc in scenarios:
+            node_dir = os.path.join(os.path.abspath(project_path), sc, node_path)
+            if os.path.isdir(node_dir):
+                import glob as _glob
+                out_files = _glob.glob(os.path.join(node_dir, "*.out"))
+                out_files += _glob.glob(os.path.join(node_dir, "n*", "*.out"))
+                tool_out = _glob.glob(os.path.join(node_dir, f"{tool_name}*.out"))
+                out_files += tool_out
+                return sorted(set(out_files))
+        return []
+    except Exception:
+        return []
+
+
 class DisplayResultsSchema(ProjectPathSchema):
     detail: str = Field(
         default="all",
@@ -708,7 +743,6 @@ class TCADDisplayResultsTool(BaseTool):
     )
     args_schema: Type[BaseModel] = DisplayResultsSchema
 
-    @_swb_locked
     def _run(self, project_path: str, detail: str = "all") -> str:
         try:
             _ensure_swbpy2()
@@ -1152,7 +1186,6 @@ class TCADTailOutputTool(BaseTool):
 
     args_schema = TailOutputSchema
 
-    @_swb_locked
     def _run(self, project_path: str, node: int,
              max_lines: int = 200, offset: int = 0) -> str:
         try:
@@ -1201,6 +1234,1037 @@ class TCADTailOutputTool(BaseTool):
             return f"读取输出失败: {type(e).__name__}: {e}"
 
 
+class ReadScriptSchema(ProjectPathSchema):
+    tool: Optional[str] = Field(
+        default=None,
+        description="工具名称（如 'sprocess', 'sdevice'）。不提供则列出所有脚本文件。"
+    )
+    node: Optional[int] = Field(
+        default=None,
+        description="指定节点编号。多实验项目中不同节点可能对应不同脚本文件。"
+    )
+    max_lines: int = Field(default=500, description="最大返回行数，默认 500")
+
+
+class TCADReadScriptTool(BaseTool):
+    name: str = "tcad_read_script"
+    description: str = (
+        "读取 SWB 项目中工具的 .cmd 仿真脚本文件内容。\n"
+        "不指定 tool 时列出项目中所有 .cmd 脚本文件。\n"
+        "指定 tool 时返回该工具对应的脚本内容（带行号）。\n"
+        "脚本文件是 TCAD 仿真的实际指令，包含 Physics、Electrode、Solve 等配置。"
+    )
+    args_schema: Type[BaseModel] = ReadScriptSchema
+
+    def _run(self, project_path: str, tool: Optional[str] = None,
+             node: Optional[int] = None, max_lines: int = 500) -> str:
+        try:
+            import glob as _glob
+            prj_abs = os.path.abspath(project_path)
+            if not os.path.isdir(prj_abs):
+                return f"项目路径不存在: {prj_abs}"
+
+            # 查找所有 .cmd 文件
+            cmd_files = sorted(_glob.glob(os.path.join(prj_abs, "*.cmd")))
+            if not cmd_files:
+                return (
+                    f"项目中没有找到 .cmd 脚本文件: {prj_abs}\n"
+                    f"提示: 新添加的工具需要先运行预处理才能生成 .cmd 脚本文件。\n"
+                    f"请调用 tcad_run_simulation(project_path='...', mode='preprocess') 先执行预处理。"
+                )
+
+            # 不指定 tool 时，列出所有脚本文件
+            if tool is None:
+                lines = [f"项目: {prj_abs}", f"找到 {len(cmd_files)} 个脚本文件:"]
+                for fpath in cmd_files:
+                    fname = os.path.basename(fpath)
+                    size = os.path.getsize(fpath)
+                    # 尝试解析文件名: {label}_{type}.cmd
+                    parts = fname.replace(".cmd", "").rsplit("_", 1)
+                    if len(parts) == 2:
+                        label, db_type = parts
+                        lines.append(f"  - {label}_{db_type}.cmd  ({size} 字节)  工具标签: {label}, 类型: {db_type}")
+                    else:
+                        lines.append(f"  - {fname}  ({size} 字节)")
+                return "\n".join(lines)
+
+            # 指定了 tool，查找对应的 .cmd 文件
+            _ensure_swbpy2()
+            tree = _get_tree(project_path)
+
+            # 获取工具的 acronym，用于精确匹配 .cmd 文件
+            tool_acronym = None
+            try:
+                all_tools = tree.AllTools()
+                if tool in all_tools:
+                    db_tool_name = tree.DBTool(tool)
+                    tool_acronym = tree.GetDBToolCtxItem(f'{db_tool_name},acronym')
+            except Exception:
+                pass
+
+            # 策略1: 按命名规则 {tool_label}_{acronym}.cmd 匹配
+            matched_files = []
+            for fpath in cmd_files:
+                fname = os.path.basename(fpath).replace(".cmd", "")
+                parts = fname.rsplit("_", 1)
+                if len(parts) == 2:
+                    label, acronym = parts
+                    # 优先匹配 tool_label + acronym 组合
+                    if label.lower() == tool.lower() and tool_acronym and acronym.lower() == tool_acronym.lower():
+                        matched_files = [fpath]  # 精确匹配，直接覆盖
+                        break
+                    # 匹配工具标签（不区分大小写）
+                    if label.lower() == tool.lower():
+                        matched_files.append(fpath)
+                    # 匹配 acronym
+                    elif acronym.lower() == tool.lower():
+                        matched_files.append(fpath)
+
+            # 策略2: 如果指定了节点，用节点信息匹配
+            if node is not None and tree.NodeExists(node):
+                node_tool = tree.NodeTool(node)
+                db_tool = tree.DBTool(node_tool) if hasattr(tree, 'DBTool') else node_tool
+                for fpath in cmd_files:
+                    fname = os.path.basename(fpath).replace(".cmd", "")
+                    parts = fname.rsplit("_", 1)
+                    if len(parts) == 2:
+                        label, db_type = parts
+                        if label == node_tool and fpath not in matched_files:
+                            matched_files.append(fpath)
+
+            # 策略3: 模糊匹配文件名包含 tool 关键字
+            if not matched_files:
+                for fpath in cmd_files:
+                    fname = os.path.basename(fpath).lower()
+                    if tool.lower() in fname and fpath not in matched_files:
+                        matched_files.append(fpath)
+
+            if not matched_files:
+                available = [os.path.basename(f) for f in cmd_files]
+                return (
+                    f"未找到工具 '{tool}' 对应的脚本文件。\n"
+                    f"可用的脚本文件: {available}"
+                )
+
+            # 读取匹配的脚本文件内容
+            result_parts = []
+            for fpath in matched_files:
+                fname = os.path.basename(fpath)
+                try:
+                    with open(fpath, "r", errors="replace") as f:
+                        lines = f.readlines()
+                except (OSError, IOError) as e:
+                    result_parts.append(f"📄 {fname}: 读取失败 ({e})")
+                    continue
+
+                total = len(lines)
+                content_lines = lines[:max_lines]
+                # 添加行号
+                numbered = []
+                for i, line in enumerate(content_lines, 1):
+                    numbered.append(f"{i:>4} | {line.rstrip()}")
+
+                result_parts.append(f"📄 {fname} ({total} 行):")
+                result_parts.append("\n".join(numbered))
+                if total > max_lines:
+                    result_parts.append(f"... (已截断，共 {total} 行，显示前 {max_lines} 行)")
+
+            return "\n\n".join(result_parts)
+
+        except ImportError:
+            return SWB_ERR_MSG
+        except Exception as e:
+            return f"读取脚本失败: {type(e).__name__}: {e}"
+
+
+class ModifyScriptSchema(ProjectPathSchema):
+    tool: str = Field(description="工具名称（如 'sprocess', 'sdevice', 'Gummel'）")
+    action: str = Field(
+        description=(
+            "操作类型:\n"
+            "  replace  — 替换文本: 需要 target + content\n"
+            "  insert   — 在指定行号前插入: 需要 line_number + content\n"
+            "  append   — 在文件末尾追加: 需要 content\n"
+            "  delete   — 删除匹配的文本: 需要 target\n"
+            "  replace_line — 替换指定行: 需要 line_number + content"
+        )
+    )
+    target: Optional[str] = Field(default=None, description="要查找的目标文本（replace/delete 时使用）")
+    content: Optional[str] = Field(default=None, description="新内容（replace/insert/append/replace_line 时使用）")
+    line_number: Optional[int] = Field(default=None, description="行号（insert/replace_line 时使用，从1开始）")
+    node: Optional[int] = Field(default=None, description="指定节点编号，用于定位具体脚本文件")
+    preview: bool = Field(default=True, description="是否返回修改后的预览（默认开启）")
+
+
+class TCADModifyScriptTool(BaseTool):
+    name: str = "tcad_modify_script"
+    description: str = (
+        "修改 SWB 项目中工具的 .cmd 仿真脚本文件。\n"
+        "支持的操作:\n"
+        "  replace      — 替换脚本中的指定文本（精确匹配）\n"
+        "  insert       — 在指定行号前插入新内容\n"
+        "  append       — 在脚本末尾追加内容\n"
+        "  delete       — 删除匹配的文本行\n"
+        "  replace_line — 替换指定行号的整行内容\n"
+        "注意: 修改 .cmd 文件是直接修改仿真脚本，不会同步到仿真树。"
+    )
+    args_schema: Type[BaseModel] = ModifyScriptSchema
+
+    def _run(self, project_path: str, tool: str, action: str,
+             target: Optional[str] = None, content: Optional[str] = None,
+             line_number: Optional[int] = None, node: Optional[int] = None,
+             preview: bool = True) -> str:
+        try:
+            import glob as _glob
+            prj_abs = os.path.abspath(project_path)
+            if not os.path.isdir(prj_abs):
+                return f"项目路径不存在: {prj_abs}"
+
+            # 查找对应的 .cmd 文件（复用 ReadScriptTool 的逻辑）
+            cmd_files = sorted(_glob.glob(os.path.join(prj_abs, "*.cmd")))
+            if not cmd_files:
+                return (
+                    f"项目中没有找到 .cmd 脚本文件: {prj_abs}\n"
+                    f"提示: 新添加的工具需要先运行预处理才能生成 .cmd 脚本文件。\n"
+                    f"请调用 tcad_run_simulation(project_path='...', mode='preprocess') 先执行预处理。"
+                )
+
+            # 获取工具的 acronym，用于精确匹配 .cmd 文件
+            _ensure_swbpy2()
+            tree = _get_tree(project_path)
+            tool_acronym = None
+            try:
+                all_tools = tree.AllTools()
+                if tool in all_tools:
+                    db_tool_name = tree.DBTool(tool)
+                    tool_acronym = tree.GetDBToolCtxItem(f'{db_tool_name},acronym')
+            except Exception:
+                pass
+
+            matched_files = []
+            for fpath in cmd_files:
+                fname = os.path.basename(fpath).replace(".cmd", "")
+                parts = fname.rsplit("_", 1)
+                if len(parts) == 2:
+                    label, acronym = parts
+                    # 优先匹配 tool_label + acronym 组合
+                    if label.lower() == tool.lower() and tool_acronym and acronym.lower() == tool_acronym.lower():
+                        matched_files = [fpath]  # 精确匹配，直接覆盖
+                        break
+                    if label.lower() == tool.lower() or acronym.lower() == tool.lower():
+                        matched_files.append(fpath)
+
+            if not matched_files:
+                for fpath in cmd_files:
+                    fname = os.path.basename(fpath).lower()
+                    if tool.lower() in fname and fpath not in matched_files:
+                        matched_files.append(fpath)
+
+            if not matched_files:
+                available = [os.path.basename(f) for f in cmd_files]
+                return (
+                    f"未找到工具 '{tool}' 对应的脚本文件。\n"
+                    f"可用的脚本文件: {available}"
+                )
+
+            if len(matched_files) > 1:
+                names = [os.path.basename(f) for f in matched_files]
+                return (
+                    f"找到多个匹配的脚本文件: {names}\n"
+                    f"请用更精确的工具名称指定。"
+                )
+
+            fpath = matched_files[0]
+            fname = os.path.basename(fpath)
+
+            # 读取原文件
+            with open(fpath, "r", errors="replace") as f:
+                original_lines = f.readlines()
+
+            original_text = "".join(original_lines)
+            new_lines = list(original_lines)
+            modified = False
+
+            action = action.strip().lower()
+
+            if action == "replace":
+                if not target:
+                    return "replace 操作需要 target 参数（要替换的文本）"
+                if content is None:
+                    return "replace 操作需要 content 参数（新文本）"
+                if target not in original_text:
+                    # 显示附近的上下文帮助用户定位
+                    similar = [l.rstrip() for l in original_lines if target[:20] in l]
+                    msg = f"未在 {fname} 中找到目标文本:\n  '{target}'"
+                    if similar:
+                        msg += f"\n找到部分匹配的行:\n" + "\n".join(f"  {l}" for l in similar[:5])
+                    return msg
+                new_text = original_text.replace(target, content, 1)
+                new_lines = new_text.splitlines(keepends=True)
+                modified = True
+
+            elif action == "insert":
+                if line_number is None:
+                    return "insert 操作需要 line_number 参数（在该行前插入）"
+                if content is None:
+                    return "insert 操作需要 content 参数"
+                if line_number < 1 or line_number > len(original_lines) + 1:
+                    return f"行号 {line_number} 超出范围 (1-{len(original_lines) + 1})"
+                insert_line = content if content.endswith("\n") else content + "\n"
+                new_lines.insert(line_number - 1, insert_line)
+                modified = True
+
+            elif action == "append":
+                if content is None:
+                    return "append 操作需要 content 参数"
+                append_line = content if content.endswith("\n") else content + "\n"
+                new_lines.append(append_line)
+                modified = True
+
+            elif action == "delete":
+                if not target:
+                    return "delete 操作需要 target 参数（要删除的文本）"
+                new_lines = [l for l in original_lines if target not in l]
+                if len(new_lines) == len(original_lines):
+                    return f"未在 {fname} 中找到包含 '{target}' 的行"
+                modified = True
+
+            elif action == "replace_line":
+                if line_number is None:
+                    return "replace_line 操作需要 line_number 参数"
+                if content is None:
+                    return "replace_line 操作需要 content 参数"
+                if line_number < 1 or line_number > len(original_lines):
+                    return f"行号 {line_number} 超出范围 (1-{len(original_lines)})"
+                new_lines[line_number - 1] = content if content.endswith("\n") else content + "\n"
+                modified = True
+
+            else:
+                return (
+                    f"不支持的操作: '{action}'\n"
+                    f"支持: replace, insert, append, delete, replace_line"
+                )
+
+            if not modified:
+                return f"文件 {fname} 未被修改"
+
+            # 写回文件
+            with open(fpath, "w") as f:
+                f.writelines(new_lines)
+
+            # 构建结果
+            result_parts = [
+                f"✅ 脚本已修改: {fname}",
+                f"  操作: {action}",
+            ]
+            if target:
+                result_parts.append(f"  目标: '{target}'")
+            if content:
+                result_parts.append(f"  新内容: '{content[:100]}{'...' if len(content) > 100 else ''}'")
+            if line_number:
+                result_parts.append(f"  行号: {line_number}")
+
+            result_parts.append(f"  修改前行数: {len(original_lines)}")
+            result_parts.append(f"  修改后行数: {len(new_lines)}")
+
+            # 返回修改后的预览
+            if preview:
+                result_parts.append(f"\n📄 修改后的 {fname} (前 30 行):")
+                for i, line in enumerate(new_lines[:30], 1):
+                    marker = " >>>" if i == line_number else "    "
+                    result_parts.append(f"{marker} {i:>4} | {line.rstrip()}")
+                if len(new_lines) > 30:
+                    result_parts.append(f"    ... (共 {len(new_lines)} 行)")
+
+            return "\n".join(result_parts)
+
+        except ImportError:
+            return SWB_ERR_MSG
+        except Exception as e:
+            return f"修改脚本失败: {type(e).__name__}: {e}"
+
+
+class WebSearchSchema(BaseModel):
+    query: str = Field(description="搜索关键词")
+    max_results: int = Field(default=5, description="最大返回结果数，默认 5")
+
+
+class TCADWebSearchTool(BaseTool):
+    name: str = "web_search"
+    description: str = (
+        "在互联网上搜索信息并返回结果摘要。\n"
+        "可用于搜索 TCAD 相关文档、技术资料、仿真参数等。\n"
+        "返回搜索结果的标题、链接和摘要。"
+    )
+    args_schema: Type[BaseModel] = WebSearchSchema
+
+    def _run(self, query: str, max_results: int = 5) -> str:
+        import requests
+        from bs4 import BeautifulSoup
+        import urllib.parse
+        import re
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        }
+
+        # 使用百度搜索
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://www.baidu.com/s?wd={encoded_query}&rn={max_results}"
+
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            results = []
+
+            # 百度搜索结果
+            for item in soup.select('.result, .c-container')[:max_results]:
+                title_elem = item.select_one('h3 a, .t a')
+                snippet_elem = item.select_one('.c-abstract, .c-span-last')
+
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+                    link = title_elem.get('href', '')
+                    snippet = snippet_elem.get_text(strip=True) if snippet_elem else '无摘要'
+                    # 过滤掉明显无关的结果
+                    if title and len(title) > 5:
+                        results.append({'title': title, 'link': link, 'body': snippet})
+
+            if results:
+                lines = [f"搜索结果: '{query}'\n{'=' * 50}"]
+                for i, r in enumerate(results[:max_results], 1):
+                    title = r.get('title', '无标题')
+                    link = r.get('link', '无链接')
+                    body = r.get('body', '无摘要')
+                    lines.append(f"\n{i}. {title}")
+                    lines.append(f"   链接: {link}")
+                    lines.append(f"   摘要: {body[:200]}{'...' if len(body) > 200 else ''}")
+                return "\n".join(lines)
+
+        except Exception as e:
+            pass
+
+        # 备用方案: 使用搜狗搜索
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://www.sogou.com/web?query={encoded_query}"
+
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            results = []
+
+            for item in soup.select('.vrwrap, .rb')[:max_results]:
+                title_elem = item.select_one('h3 a')
+                snippet_elem = item.select_one('.space-txt, .str_info')
+
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+                    link = title_elem.get('href', '')
+                    snippet = snippet_elem.get_text(strip=True) if snippet_elem else '无摘要'
+                    if title and len(title) > 5:
+                        results.append({'title': title, 'link': link, 'body': snippet})
+
+            if results:
+                lines = [f"搜索结果: '{query}'\n{'=' * 50}"]
+                for i, r in enumerate(results[:max_results], 1):
+                    title = r.get('title', '无标题')
+                    link = r.get('link', '无链接')
+                    body = r.get('body', '无摘要')
+                    lines.append(f"\n{i}. {title}")
+                    lines.append(f"   链接: {link}")
+                    lines.append(f"   摘要: {body[:200]}{'...' if len(body) > 200 else ''}")
+                return "\n".join(lines)
+
+        except Exception:
+            pass
+
+        return (
+            f"搜索失败: 无法获取搜索结果。\n"
+            f"建议: 请检查网络连接或稍后重试。"
+        )
+
+
+class WebFetchSchema(BaseModel):
+    url: str = Field(description="要获取的网页 URL")
+    max_length: int = Field(default=5000, description="返回内容最大长度，默认 5000 字符")
+
+
+class TCADWebFetchTool(BaseTool):
+    name: str = "web_fetch"
+    description: str = (
+        "获取指定网页的内容并返回文本摘要。\n"
+        "可用于读取在线文档、技术文章等。"
+    )
+    args_schema: Type[BaseModel] = WebFetchSchema
+
+    def _run(self, url: str, max_length: int = 5000) -> str:
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # 移除脚本和样式
+            for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
+                tag.decompose()
+
+            # 获取文本
+            text = soup.get_text(separator='\n', strip=True)
+
+            # 清理多余空行
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            text = '\n'.join(lines)
+
+            if len(text) > max_length:
+                text = text[:max_length] + f"\n\n... (内容已截断，共 {len(text)} 字符)"
+
+            return f"网页内容: {url}\n{'=' * 50}\n{text}"
+
+        except ImportError:
+            return "错误: requests 或 beautifulsoup4 库未安装"
+        except requests.exceptions.RequestException as e:
+            return f"获取网页失败: {e}"
+        except Exception as e:
+            return f"处理网页失败: {type(e).__name__}: {e}"
+
+
+class TCADDocSearchSchema(BaseModel):
+    query: str = Field(description="搜索关键词（如命令名、功能描述等）")
+    tool: Optional[str] = Field(
+        default=None,
+        description="指定工具文档: 'sde' | 'sdevice' | 'sprocess' | 'svisual'。不指定则搜索所有文档。"
+    )
+    max_results: int = Field(default=5, description="最大返回结果数，默认 5")
+
+
+class TCADDocSearchTool(BaseTool):
+    name: str = "tcad_doc_search"
+    description: str = (
+        "搜索 TCAD 本地文档和手册。\n"
+        "可用于查找 sdevice、sde、sprocess 等工具的命令语法、参数说明、示例等。\n"
+        "比 web_search 更精确地获取 TCAD 专业技术文档。"
+    )
+    args_schema: Type[BaseModel] = TCADDocSearchSchema
+
+    def _run(self, query: str, tool: Optional[str] = None, max_results: int = 5) -> str:
+        try:
+            import re
+            from bs4 import BeautifulSoup
+
+            tcad_root = TCAD_ROOT
+            tcad_release = TCAD_RELEASE
+
+            # 文档目录映射
+            doc_dirs = {
+                'sde': [
+                    os.path.join(tcad_root, 'tcad', tcad_release, 'Sentaurus_Training', 'sde'),
+                    os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_sde_ug'),
+                ],
+                'sdevice': [
+                    os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_sdevice_ug'),
+                    os.path.join(tcad_root, 'tcad', tcad_release, 'Sentaurus_Training', 'sdevice'),
+                ],
+                'sprocess': [
+                    os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_sprocess_ug'),
+                ],
+                'svisual': [
+                    os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_svisual_ug'),
+                ],
+            }
+
+            # 确定搜索目录
+            if tool and tool.lower() in doc_dirs:
+                search_dirs = doc_dirs[tool.lower()]
+            else:
+                search_dirs = []
+                for dirs in doc_dirs.values():
+                    search_dirs.extend(dirs)
+
+            results = []
+            query_lower = query.lower()
+
+            for doc_dir in search_dirs:
+                if not os.path.isdir(doc_dir):
+                    continue
+
+                for root, dirs, files in os.walk(doc_dir):
+                    for fname in files:
+                        if not fname.endswith('.html'):
+                            continue
+
+                        fpath = os.path.join(root, fname)
+                        try:
+                            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+
+                            # 检查关键词是否出现
+                            if query_lower not in content.lower():
+                                continue
+
+                            soup = BeautifulSoup(content, 'html.parser')
+
+                            # 移除脚本和样式
+                            for tag in soup(['script', 'style']):
+                                tag.decompose()
+
+                            text = soup.get_text(separator='\n', strip=True)
+
+                            # 查找包含关键词的段落
+                            paragraphs = text.split('\n\n')
+                            relevant = []
+                            for para in paragraphs:
+                                if query_lower in para.lower():
+                                    # 截取相关部分
+                                    para_clean = para.strip()
+                                    if len(para_clean) > 50:
+                                        relevant.append(para_clean[:300])
+
+                            if relevant:
+                                rel_path = os.path.relpath(fpath, tcad_root)
+                                results.append({
+                                    'file': rel_path,
+                                    'content': '\n'.join(relevant[:3]),
+                                })
+
+                        except Exception:
+                            continue
+
+            if not results:
+                return f"未在 TCAD 文档中找到与 '{query}' 相关的内容"
+
+            lines = [f"TCAD 文档搜索结果: '{query}'\n{'=' * 50}"]
+            for i, r in enumerate(results[:max_results], 1):
+                lines.append(f"\n{i}. 文件: {r['file']}")
+                lines.append(f"   内容:\n{r['content'][:500]}{'...' if len(r['content']) > 500 else ''}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"文档搜索失败: {type(e).__name__}: {e}"
+
+
+class TCADExampleSearchSchema(BaseModel):
+    tool: str = Field(description="工具名称: 'sde' | 'sdevice' | 'sprocess' | 'svisual'")
+    keyword: Optional[str] = Field(default=None, description="可选关键词，用于过滤示例")
+
+
+class TCADExampleSearchTool(BaseTool):
+    name: str = "tcad_example_search"
+    description: str = (
+        "搜索 TCAD Applications_Library 中的示例项目。\n"
+        "可用于查找特定工具的使用示例、脚本模板等。\n"
+        "返回示例项目的路径和关键文件内容。"
+    )
+    args_schema: Type[BaseModel] = TCADExampleSearchSchema
+
+    def _run(self, tool: str, keyword: Optional[str] = None) -> str:
+        try:
+            from bs4 import BeautifulSoup
+
+            tcad_root = TCAD_ROOT
+            tcad_release = TCAD_RELEASE
+
+            # 示例目录
+            examples_dir = os.path.join(tcad_root, 'tcad', tcad_release, 'Applications_Library')
+            if not os.path.isdir(examples_dir):
+                return f"示例目录不存在: {examples_dir}"
+
+            results = []
+            tool_lower = tool.lower()
+
+            for root, dirs, files in os.walk(examples_dir):
+                # 查找包含指定工具的目录
+                if tool_lower not in root.lower():
+                    continue
+
+                # 检查是否有 .cmd 文件
+                cmd_files = [f for f in files if f.endswith('.cmd') and tool_lower in f.lower()]
+                if not cmd_files:
+                    continue
+
+                # 如果有关键词过滤
+                if keyword:
+                    keyword_lower = keyword.lower()
+                    found = False
+                    for cmd_file in cmd_files:
+                        cmd_path = os.path.join(root, cmd_file)
+                        try:
+                            with open(cmd_path, 'r', errors='ignore') as f:
+                                if keyword_lower in f.read().lower():
+                                    found = True
+                                    break
+                        except Exception:
+                            pass
+                    if not found:
+                        continue
+
+                # 收集示例信息
+                rel_path = os.path.relpath(root, examples_dir)
+                readme = None
+                for f in files:
+                    if f.startswith('greadme') and f.endswith('.html'):
+                        readme_path = os.path.join(root, f)
+                        try:
+                            with open(readme_path, 'r', errors='ignore') as f:
+                                soup = BeautifulSoup(f.read(), 'html.parser')
+                                readme = soup.get_text()[:200]
+                        except Exception:
+                            pass
+
+                results.append({
+                    'path': rel_path,
+                    'cmd_files': cmd_files[:3],
+                    'readme': readme,
+                })
+
+            if not results:
+                return f"未找到包含 '{tool}' 工具的示例项目"
+
+            lines = [f"TCAD 示例项目: {tool}\n{'=' * 50}"]
+            for i, r in enumerate(results[:5], 1):
+                lines.append(f"\n{i}. 路径: {r['path']}")
+                lines.append(f"   脚本文件: {', '.join(r['cmd_files'])}")
+                if r['readme']:
+                    lines.append(f"   说明: {r['readme'][:150]}...")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"示例搜索失败: {type(e).__name__}: {e}"
+
+
+class CommandRefSchema(BaseModel):
+    command: str = Field(
+        description=(
+            "命令名称，支持以下格式:\n"
+            "  'sdegeo:create-rectangle' — 完整命令名\n"
+            "  'create-rectangle' — 命令名（自动匹配工具）\n"
+            "  'Electrode' — sdevice 命令块\n"
+            "  'Physics' — 物理模型命令\n"
+            "  'Solve' — 求解命令"
+        )
+    )
+    tool: Optional[str] = Field(
+        default=None,
+        description="指定工具: 'sde' | 'sdevice' | 'sprocess'。不指定则自动检测。"
+    )
+    max_length: int = Field(
+        default=3000,
+        description="返回内容最大长度，默认 3000 字符。设置为 0 表示返回全部内容。"
+    )
+
+
+class TCADCommandRefTool(BaseTool):
+    name: str = "tcad_command_ref"
+    description: str = (
+        "TCAD 命令速查工具。\n"
+        "快速查找特定命令的语法、参数和示例。\n"
+        "比 tcad_doc_search 更精确，适合查找单个命令的详细用法。\n"
+        "推荐在编写脚本前使用此工具确认命令语法。"
+    )
+    args_schema: Type[BaseModel] = CommandRefSchema
+
+    def _run(self, command: str, tool: Optional[str] = None, max_length: int = 3000) -> str:
+        try:
+            from bs4 import BeautifulSoup
+
+            tcad_root = TCAD_ROOT
+            tcad_release = TCAD_RELEASE
+
+            # 规范化命令名
+            cmd_lower = command.lower().replace('_', '-').replace(' ', '-')
+
+            # 自动检测工具
+            if tool is None:
+                if cmd_lower.startswith('sdegeo:') or cmd_lower.startswith('sdedr:') or cmd_lower.startswith('sde:'):
+                    tool = 'sde'
+                elif cmd_lower.startswith('sdegeo') or cmd_lower.startswith('sdedr'):
+                    tool = 'sde'
+                elif cmd_lower in ['electrode', 'physics', 'solve', 'math', 'file', 'plot', 'current']:
+                    tool = 'sdevice'
+                else:
+                    tool = 'sde'  # 默认
+
+            # 文档目录映射
+            doc_dirs = {
+                'sde': os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_sde_ug', 'commands'),
+                'sdevice': os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_sdevice_ug'),
+                'sprocess': os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus', 'tcad_sprocess_ug'),
+            }
+
+            doc_dir = doc_dirs.get(tool)
+            if not doc_dir or not os.path.isdir(doc_dir):
+                return f"文档目录不存在: {doc_dir}"
+
+            # 构建文件名
+            # sdegeo:create-rectangle -> sdegeo_create_rectangle.html
+            cmd_file_name = cmd_lower.replace(':', '_').replace('-', '_') + '.html'
+
+            # 尝试直接查找文件
+            target_file = None
+
+            # 策略1: 直接匹配文件名
+            if os.path.exists(os.path.join(doc_dir, cmd_file_name)):
+                target_file = os.path.join(doc_dir, cmd_file_name)
+
+            # 策略2: 在子目录中查找
+            if target_file is None:
+                for root, dirs, files in os.walk(doc_dir):
+                    for f in files:
+                        if f == cmd_file_name:
+                            target_file = os.path.join(root, f)
+                            break
+                    if target_file:
+                        break
+
+            # 策略3: 模糊匹配
+            if target_file is None:
+                cmd_keywords = cmd_lower.replace(':', ' ').replace('-', ' ').split()
+                for root, dirs, files in os.walk(doc_dir):
+                    for f in files:
+                        if not f.endswith('.html'):
+                            continue
+                        fname_lower = f.lower()
+                        if all(kw in fname_lower for kw in cmd_keywords):
+                            target_file = os.path.join(root, f)
+                            break
+                    if target_file:
+                        break
+
+            if target_file is None:
+                return f"未找到命令 '{command}' 的文档。请尝试使用 tcad_doc_search 搜索关键词。"
+
+            # 读取文档
+            with open(target_file, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            soup = BeautifulSoup(content, 'html.parser')
+            for tag in soup(['script', 'style']):
+                tag.decompose()
+
+            text = soup.get_text(separator='\n', strip=True)
+
+            # 提取关键部分
+            lines = text.split('\n')
+            result_lines = []
+            in_section = None
+            section_content = []
+
+            # 定义要提取的章节
+            sections_to_extract = [
+                'description', 'syntax', 'examples', 'example',
+                'arguments', 'argument', 'parameters', 'parameters:',
+                'options', 'usage', 'notes', 'related'
+            ]
+
+            for line in lines:
+                line_stripped = line.strip()
+                line_lower = line_stripped.lower()
+
+                # 检测章节标题
+                if line_lower in sections_to_extract or line_lower.endswith(':'):
+                    section_name = line_lower.rstrip(':')
+                    if section_name in sections_to_extract:
+                        # 保存之前的章节内容
+                        if in_section and section_content:
+                            result_lines.append(f'\n── {in_section.upper()} ──')
+                            result_lines.extend(section_content)
+                        in_section = section_name
+                        section_content = []
+                        continue
+
+                # 收集章节内容
+                if in_section and line_stripped:
+                    section_content.append(f"  {line_stripped}")
+
+                # 如果章节内容太多，只保留关键部分
+                if len(section_content) > 50:
+                    section_content = section_content[:50]
+                    section_content.append("  ... (章节内容过长，已截断)")
+
+            # 保存最后一个章节
+            if in_section and section_content:
+                result_lines.append(f'\n── {in_section.upper()} ──')
+                result_lines.extend(section_content)
+
+            # 如果没有提取到结构化内容，返回文档的前部分内容
+            if not result_lines:
+                result_lines = [line for line in lines[:100] if line.strip()]
+
+            # 构建结果
+            result = f"📖 命令: {command}\n{'=' * 50}\n"
+            result += '\n'.join(result_lines)
+
+            # 应用 max_length 限制
+            if max_length > 0 and len(result) > max_length:
+                result = result[:max_length] + f"\n\n... (内容已截断，共 {len(result)} 字符，显示前 {max_length} 字符)"
+
+            return result
+
+        except Exception as e:
+            return f"命令查询失败: {type(e).__name__}: {e}"
+
+
+class DocReadSchema(BaseModel):
+    file_path: str = Field(
+        description=(
+            "文档文件路径，支持以下格式:\n"
+            "  'tcad_sdevice_ug/physics_in_sentaurus_device.html' — 相对于 TCAD 文档目录\n"
+            "  'tcad_sde_ug/commands/sdegeo_create_rectangle.html' — 完整相对路径\n"
+            "  绝对路径也可以直接使用"
+        )
+    )
+    section: Optional[str] = Field(
+        default=None,
+        description="指定要读取的章节（如 'Mobility', 'Syntax', 'Examples'）。不指定则读取全文。"
+    )
+    max_length: int = Field(
+        default=5000,
+        description="返回内容最大长度，默认 5000 字符。设置为 0 表示返回全部内容。"
+    )
+
+
+class TCADDocReadTool(BaseTool):
+    name: str = "tcad_doc_read"
+    description: str = (
+        "读取 TCAD 文档文件的完整内容。\n"
+        "可用于深入阅读特定文档章节，获取详细的语法说明和示例。\n"
+        "支持指定章节读取，避免返回过多无关内容。"
+    )
+    args_schema: Type[BaseModel] = DocReadSchema
+
+    def _run(self, file_path: str, section: Optional[str] = None, max_length: int = 5000) -> str:
+        try:
+            from bs4 import BeautifulSoup
+
+            tcad_root = TCAD_ROOT
+            tcad_release = TCAD_RELEASE
+
+            # 解析文件路径
+            if os.path.isabs(file_path):
+                full_path = file_path
+            else:
+                # 尝试在文档目录中查找
+                doc_base = os.path.join(tcad_root, 'tcad', tcad_release, 'manuals', 'olh_sentaurus')
+                full_path = os.path.join(doc_base, file_path)
+
+                # 如果找不到，尝试其他目录
+                if not os.path.exists(full_path):
+                    training_base = os.path.join(tcad_root, 'tcad', tcad_release, 'Sentaurus_Training')
+                    full_path = os.path.join(training_base, file_path)
+
+            if not os.path.exists(full_path):
+                return f"文档文件不存在: {full_path}"
+
+            # 读取文档
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            soup = BeautifulSoup(content, 'html.parser')
+            for tag in soup(['script', 'style']):
+                tag.decompose()
+
+            text = soup.get_text(separator='\n', strip=True)
+            lines = text.split('\n')
+
+            # 如果指定了章节，只提取该章节
+            if section:
+                section_lower = section.lower()
+                result_lines = []
+                in_section = False
+                section_found = False
+                section_start_line = -1
+
+                # 首先找到章节的起始位置
+                for i, line in enumerate(lines):
+                    line_stripped = line.strip()
+                    line_lower = line_stripped.lower()
+
+                    # 检测章节开始（更严格的匹配）
+                    if section_lower in line_lower:
+                        # 检查是否是独立的章节标题（不是目录项）
+                        if (line_lower.endswith(':') or
+                            (len(line_stripped) < 50 and not line_stripped.startswith('•'))):
+                            section_start_line = i
+                            section_found = True
+                            break
+
+                if not section_found:
+                    return f"未找到章节 '{section}'。请尝试使用 tcad_doc_search 搜索相关关键词。"
+
+                # 从章节开始位置提取内容
+                in_section = True
+                for i in range(section_start_line, len(lines)):
+                    line_stripped = lines[i].strip()
+                    line_lower = line_stripped.lower()
+
+                    # 跳过章节标题本身
+                    if i == section_start_line:
+                        result_lines.append(f"── {line_stripped} ──")
+                        continue
+
+                    # 检测章节结束（遇到新的主章节标题）
+                    if in_section and line_stripped:
+                        # 新的主章节标题通常是大写开头，较短，且不是列表项
+                        if (line_stripped[0].isupper() and
+                            len(line_stripped) < 50 and
+                            not line_stripped.startswith('•') and
+                            not line_stripped.startswith('-') and
+                            not line_stripped.startswith('(')):
+                            # 检查是否是已知的章节标题
+                            known_sections = [
+                                'description', 'syntax', 'examples', 'example',
+                                'arguments', 'argument', 'parameters', 'parameters:',
+                                'options', 'usage', 'notes', 'related', 'returns',
+                                'see also', 'references', 'generation', 'recombination',
+                                'traps', 'tunneling', 'noise', 'radiation'
+                            ]
+                            if any(keyword in line_lower for keyword in known_sections):
+                                in_section = False
+                                continue
+
+                    # 收集章节内容
+                    if in_section and line_stripped:
+                        result_lines.append(line_stripped)
+
+                    # 限制章节内容长度
+                    if len(result_lines) > 200:
+                        result_lines.append("... (章节内容过长，已截断)")
+                        break
+
+                result_text = '\n'.join(result_lines)
+            else:
+                # 返回全文
+                result_text = '\n'.join(line for line in lines if line.strip())
+
+            # 构建结果
+            rel_path = os.path.relpath(full_path, tcad_root)
+            result = f"📖 文档: {rel_path}\n{'=' * 50}\n"
+
+            # 应用 max_length 限制
+            if max_length > 0 and len(result_text) > max_length:
+                result += result_text[:max_length] + f"\n\n... (内容已截断，共 {len(result_text)} 字符，显示前 {max_length} 字符)"
+            else:
+                result += result_text
+
+            return result
+
+        except Exception as e:
+            return f"文档读取失败: {type(e).__name__}: {e}"
+
+
 def get_tcad_tools() -> List[BaseTool]:
     return [
         TCADProjectTool(),
@@ -1210,7 +2274,14 @@ def get_tcad_tools() -> List[BaseTool]:
         TCADResultsTool(),
         TCADCleanupTool(),
         TCADTailOutputTool(),
-        TCADDisplayResultsTool(),
+        TCADReadScriptTool(),
+        TCADModifyScriptTool(),
+        TCADWebSearchTool(),
+        TCADWebFetchTool(),
+        TCADDocSearchTool(),
+        TCADExampleSearchTool(),
+        TCADCommandRefTool(),
+        TCADDocReadTool(),
     ]
 
 
