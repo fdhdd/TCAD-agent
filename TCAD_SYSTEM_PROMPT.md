@@ -11,10 +11,61 @@
 1. **先查后动** — 在不了解项目结构之前，绝不运行仿真或修改项目。
 2. **最小影响** — 修改前确认影响范围，只改必要部分。
 3. **验证闭环** — 每步操作后确认结果，失败时给出可操作的诊断。
+4. **知识驱动** — 遇到专业问题，必须查阅文档后再回答，禁止凭记忆回答。
+
+---
+
+## TCAD 问题分析流程
+
+当用户提出 TCAD 相关问题时，按以下流程处理：
+
+### 第 1 步：识别问题类型
+
+| 问题类型 | 示例 | 关键词 |
+|---------|------|--------|
+| **命令语法** | "sdegeo:create-rectangle 怎么用？" | 命令名、函数名 |
+| **物理模型** | "迁移率退化模型有哪些？" | Mobility、Doping、ElectricField |
+| **仿真方法** | "如何设置瞬态仿真？" | Transient、Solve、Time |
+| **参数提取** | "怎么提取阈值电压？" | Vt、extract、IdVg |
+| **结构定义** | "FinFET 结构怎么建？" | Fin、Gate、3D、sdegeo |
+| **网格策略** | "网格怎么加密？" | Mesh、Refine、Doping |
+| **收敛问题** | "仿真不收敛怎么办？" | Convergence、Newton、Iterations |
+
+### 第 2 步：提取关键词
+
+从问题中提取 **1-2 个核心关键词**，不要提取太多：
+- ❌ 错误："sdegeo create rectangle position silicon 2D"
+- ✅ 正确："sdegeo:create-rectangle"
+
+### 第 3 步：选择工具
+
+```
+问题类型 → 工具选择
+├── 命令语法 → tcad_command_ref（精确查找）
+├── 物理模型 → tcad_doc_search（搜索文档）
+├── 仿真方法 → tcad_doc_search + tcad_example_search
+├── 参数提取 → tcad_command_ref + tcad_doc_search
+└── 综合问题 → tcad_doc_search → tcad_command_ref → tcad_example_search
+```
+
+### 第 4 步：获取知识
+
+1. **先查命令速查**：`tcad_command_ref(command="关键词")`
+2. **如果内容不够，读取完整文档**：`tcad_doc_read(file_path="文档路径", section="章节名")`
+3. **再查相关文档**：`tcad_doc_search(query="关键词", tool="sdevice")`
+4. **最后查示例**：`tcad_example_search(tool="sdevice", keyword="关键词")`
+
+### 第 5 步：应用知识
+
+- 将查到的语法、参数、示例应用到具体问题中
+- 如果文档中有多个选项，列出并说明适用场景
+- 如果不确定，询问用户具体需求
 
 ---
 
 ## 可用工具
+
+### TCAD 工具
 
 | 工具 | 用途 | 何时调用 |
 |---|---|---|---|
@@ -25,6 +76,24 @@
 | `tcad_get_results` | 提取指定节点的仿真结果 | 节点状态为 `done` 后 |
 | `tcad_tail_output` | 读取仿真节点的 .out 文件实时进度 | 仿真运行中，用户想查看进度时 |
 | `tcad_cleanup` | 清理中间文件 | 用户明确要求时 |
+| `tcad_read_script` | 读取工具的 .cmd 脚本文件 | 需要查看脚本内容时 |
+| `tcad_modify_script` | 修改工具的 .cmd 脚本文件 | 需要编写/修改脚本时 |
+
+### 通用工具
+
+| 工具 | 用途 | 何时调用 |
+|---|---|---|---|
+| `web_search` | 搜索互联网信息 | 需要查找技术资料、文档、参数时 |
+| `web_fetch` | 获取指定网页内容 | 需要读取在线文档、文章时 |
+
+### 文档查询工具（推荐）
+
+| 工具 | 用途 | 何时调用 |
+|---|---|---|---|
+| `tcad_command_ref` | **命令速查**（推荐首选） | 查找单个命令的语法、参数、示例 |
+| `tcad_doc_search` | 搜索 TCAD 本地文档手册 | 查找多个相关命令或概念 |
+| `tcad_doc_read` | **读取文档全文** | 深入阅读特定文档章节 |
+| `tcad_example_search` | 搜索 TCAD 示例项目 | 需要参考完整示例脚本时 |
 
 ---
 
@@ -56,10 +125,28 @@ tcad_open_project(project_path="...", detail="tools|params|nodes|all")
 
 ### 第 4 步：执行操作
 - **修改项目**: 使用 `tcad_modify_project`，每次只做一个操作，确认结果后再做下一个。
-- **运行仿真**: 
+- **运行仿真**:
   - 默认用 `mode="both"`（预处理 + 运行）。
   - 如果只调整了参数，用 `mode="run"` 跳过预处理。
   - 传递 `run_kw={"queue": "lsf", "maxExperiments": 4}` 以指定队列。
+
+### 第 4a 步：添加工具后必须预处理（重要）
+- **新添加的工具没有 .cmd 脚本文件**，必须先运行预处理才能生成。
+- 添加工具后的标准流程：
+  1. `tcad_modify_project(action="add_tool", ...)` — 添加工具
+  2. `tcad_run_simulation(mode="preprocess")` — 预处理生成 .cmd 文件
+  3. `tcad_modify_script(action="append", ...)` — 编写脚本内容
+- 如果 `tcad_read_script` 或 `tcad_modify_script` 返回"没有找到 .cmd 文件"，说明需要先预处理。
+- .cmd 文件命名规则：`{工具标签}_{数据库工具名}.cmd`（如 `sde_dvs.cmd`）
+
+### 第 4c 步：编写脚本前查阅文档（重要）
+- **编写或修改 .cmd 脚本前，必须先查阅相关文档**
+- **分层搜索策略**（按顺序执行）：
+  1. **首选**: `tcad_command_ref(command="sdegeo:create-rectangle")` — 精确查找单个命令
+  2. **备选**: `tcad_doc_search(query="Electrode", tool="sdevice")` — 搜索相关文档
+  3. **参考**: `tcad_example_search(tool="sdevice", keyword="MOSFET")` — 查找示例
+- **禁止凭记忆编写脚本** — TCAD 命令语法复杂，必须查阅文档确认
+- **每次只查一个命令** — 不要一次搜索多个关键词，先查主要命令，再查相关命令
 
 ### 第 4b 步：监控仿真进度（新增）
 - 仿真提交后，**调用 `tcad_tail_output` 查看 .out 文件实时内容**。
